@@ -4,13 +4,16 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import json
 import os
 import re
 import secrets
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from collections import deque
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 
@@ -60,6 +63,46 @@ def detect_image_type(image_bytes: bytes) -> tuple[str, str] | None:
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+class UploadRateLimiter:
+    """Simple in-memory per-key sliding window limiter."""
+
+    def __init__(self):
+        self._events: dict[str, deque[float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def check(self, key: str, limit: int, window_sec: int) -> tuple[bool, int]:
+        if limit <= 0 or window_sec <= 0:
+            return True, 0
+
+        now = monotonic()
+        cutoff = now - window_sec
+
+        async with self._lock:
+            bucket = self._events.get(key)
+            if bucket is None:
+                bucket = deque()
+                self._events[key] = bucket
+
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+
+            if len(bucket) >= limit:
+                retry_after = int(window_sec - (now - bucket[0])) + 1
+                if retry_after < 1:
+                    retry_after = 1
+                return False, retry_after
+
+            bucket.append(now)
+
+            # Prevent unbounded growth under bot scans.
+            if len(self._events) > 4096:
+                stale_keys = [k for k, v in self._events.items() if not v or v[-1] <= cutoff]
+                for stale_key in stale_keys:
+                    self._events.pop(stale_key, None)
+
+            return True, 0
 
 
 class ImageStore:
@@ -119,6 +162,84 @@ class ImageStore:
         if not row:
             return None
         return dict(row)
+
+    async def delete_image(self, image_id: str) -> dict[str, Any]:
+        async with self._lock:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                "SELECT id, filename FROM images WHERE id = ?",
+                (image_id,),
+            ).fetchone()
+            if not row:
+                return {"deleted": False, "reason": "not_found"}
+
+            record = dict(row)
+            file_removed = False
+            file_path = self.images_dir / str(record["filename"])
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                    file_removed = True
+                except Exception:
+                    logger.exception("[ImageBed] failed to remove file: %s", file_path)
+
+            conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
+            conn.commit()
+
+        return {"deleted": True, "file_removed": file_removed}
+
+    async def cleanup_older_than(self, days: int, limit: int = 1000) -> dict[str, Any]:
+        if days < 1:
+            raise ValueError("days 必须大于 0")
+        if limit < 1:
+            raise ValueError("limit 必须大于 0")
+
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).replace(microsecond=0).isoformat()
+
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                """
+                SELECT id, filename, created_at
+                FROM images
+                WHERE created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+
+            if not rows:
+                return {
+                    "cutoff": cutoff,
+                    "matched": 0,
+                    "deleted": 0,
+                    "files_removed": 0,
+                }
+
+            delete_ids: list[tuple[str]] = []
+            files_removed = 0
+            for row in rows:
+                record = dict(row)
+                image_id = str(record["id"])
+                file_path = self.images_dir / str(record["filename"])
+                if file_path.exists():
+                    try:
+                        file_path.unlink()
+                        files_removed += 1
+                    except Exception:
+                        logger.exception("[ImageBed] failed to remove file during cleanup: %s", file_path)
+                delete_ids.append((image_id,))
+
+            conn.executemany("DELETE FROM images WHERE id = ?", delete_ids)
+            conn.commit()
+
+        return {
+            "cutoff": cutoff,
+            "matched": len(rows),
+            "deleted": len(delete_ids),
+            "files_removed": files_removed,
+        }
 
     def file_path(self, record: dict[str, Any]) -> Path:
         return self.images_dir / str(record["filename"])
@@ -200,7 +321,10 @@ class LocalImageBedPlugin(Star):
         self.plugin_name = "astrbot_plugin_local_image_bed"
 
         plugin_data_dir = Path(get_astrbot_data_path()) / "plugin_data" / self.plugin_name
+        self.plugin_data_dir = plugin_data_dir
         self.store = ImageStore(plugin_data_dir)
+        self._upload_rate_limiter = UploadRateLimiter()
+        self._audit_lock = asyncio.Lock()
 
         self._http_app: web.Application | None = None
         self._http_runner: web.AppRunner | None = None
@@ -271,6 +395,43 @@ class LocalImageBedPlugin(Star):
     def _upload_token(self) -> str:
         return self._cfg_str("upload_token", "")
 
+    def _audit_log_path(self) -> Path:
+        return self.plugin_data_dir / "audit_upload.jsonl"
+
+    def _enable_url_upload(self) -> bool:
+        return self._cfg_bool("enable_url_upload", False)
+
+    def _rate_limit_config(self) -> tuple[int, int]:
+        count = self._cfg_int("upload_rate_limit_count", 30)
+        window_sec = self._cfg_int("upload_rate_limit_window_sec", 60)
+        if count < 0:
+            count = 0
+        if window_sec < 0:
+            window_sec = 0
+        return count, window_sec
+
+    def _request_client_id(self, request: web.Request) -> str:
+        forwarded_for = request.headers.get("X-Forwarded-For", "").strip()
+        if forwarded_for:
+            first = forwarded_for.split(",")[0].strip()
+            if first:
+                return first
+
+        real_ip = request.headers.get("X-Real-IP", "").strip()
+        if real_ip:
+            return real_ip
+
+        if request.remote:
+            return request.remote
+        return "unknown"
+
+    async def _check_upload_rate_limit(self, request: web.Request) -> tuple[bool, int]:
+        limit, window_sec = self._rate_limit_config()
+        if limit <= 0 or window_sec <= 0:
+            return True, 0
+        key = self._request_client_id(request)
+        return await self._upload_rate_limiter.check(key, limit, window_sec)
+
     def _token_ok(self, request: web.Request) -> bool:
         required = self._upload_token()
         if not required:
@@ -278,11 +439,81 @@ class LocalImageBedPlugin(Star):
 
         provided = request.headers.get("X-ImageBed-Token", "")
         if not provided:
-            provided = request.query.get("token", "")
-        if not provided:
             return False
 
         return secrets.compare_digest(required, provided)
+
+    async def _write_audit_log(self, data: dict[str, Any]) -> None:
+        path = self._audit_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(data, ensure_ascii=False)
+        async with self._audit_lock:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    async def _audit_upload_event(
+        self,
+        request: web.Request,
+        *,
+        status: int,
+        result: str,
+        reason: str = "",
+        image_id: str = "",
+        size: int = 0,
+        mime: str = "",
+        deduplicated: bool | None = None,
+    ) -> None:
+        record = {
+            "ts": utc_now_iso(),
+            "event": "http_upload",
+            "status": status,
+            "result": result,
+            "reason": reason,
+            "client_ip": self._request_client_id(request),
+            "method": request.method,
+            "path": request.path_qs,
+            "content_type": request.content_type or "",
+            "content_length": request.content_length or 0,
+            "user_agent": request.headers.get("User-Agent", ""),
+            "image_id": image_id,
+            "size": size,
+            "mime": mime,
+            "deduplicated": deduplicated,
+        }
+        await self._write_audit_log(record)
+
+    async def _audit_command_event(
+        self,
+        event: AstrMessageEvent,
+        *,
+        command: str,
+        result: str,
+        reason: str = "",
+        image_id: str = "",
+        days: int | None = None,
+        limit: int | None = None,
+        deleted: int | None = None,
+    ) -> None:
+        sender_id = ""
+        try:
+            sender_id = str(event.get_sender_id())
+        except Exception:
+            sender_id = ""
+        record = {
+            "ts": utc_now_iso(),
+            "event": "command",
+            "command": command,
+            "result": result,
+            "reason": reason,
+            "sender_id": sender_id,
+            "role": getattr(event, "role", ""),
+            "image_id": image_id,
+            "days": days,
+            "limit": limit,
+            "deleted": deleted,
+            "umo": getattr(event, "unified_msg_origin", ""),
+        }
+        await self._write_audit_log(record)
 
     def _json_error(self, message: str, status: int = 400) -> web.Response:
         return web.json_response({"ok": False, "error": message}, status=status)
@@ -358,7 +589,25 @@ class LocalImageBedPlugin(Star):
         return response
 
     async def _http_upload(self, request: web.Request) -> web.Response:
+        allowed, retry_after = await self._check_upload_rate_limit(request)
+        if not allowed:
+            await self._audit_upload_event(
+                request,
+                status=429,
+                result="rate_limited",
+                reason=f"retry_after={retry_after}",
+            )
+            resp = self._json_error(f"上传过于频繁，请在 {retry_after} 秒后重试", status=429)
+            resp.headers["Retry-After"] = str(retry_after)
+            return resp
+
         if not self._token_ok(request):
+            await self._audit_upload_event(
+                request,
+                status=401,
+                result="unauthorized",
+                reason="token_invalid_or_missing",
+            )
             return self._json_error("未授权：token 不正确", status=401)
 
         try:
@@ -369,13 +618,40 @@ class LocalImageBedPlugin(Star):
                 original_name=original_name,
             )
         except ValueError as exc:
+            await self._audit_upload_event(
+                request,
+                status=400,
+                result="rejected",
+                reason=str(exc),
+            )
             return self._json_error(str(exc), status=400)
         except web.HTTPRequestEntityTooLarge:
+            await self._audit_upload_event(
+                request,
+                status=413,
+                result="rejected",
+                reason="payload_too_large",
+            )
             return self._json_error("图片大小超出限制", status=413)
         except Exception as exc:
             logger.exception("[ImageBed] upload failed: %s", exc)
+            await self._audit_upload_event(
+                request,
+                status=500,
+                result="error",
+                reason=str(exc),
+            )
             return self._json_error("服务器内部错误", status=500)
 
+        await self._audit_upload_event(
+            request,
+            status=200,
+            result="ok",
+            image_id=str(record.get("id") or ""),
+            size=int(record.get("size") or 0),
+            mime=str(record.get("mime") or ""),
+            deduplicated=bool(record.get("deduplicated")),
+        )
         return web.json_response({"ok": True, **record})
 
     async def _read_upload_payload(self, request: web.Request) -> tuple[bytes, str]:
@@ -487,10 +763,29 @@ class LocalImageBedPlugin(Star):
         try:
             result = await self._extract_image_from_event(event)
             if result is None:
+                if not self._enable_url_upload():
+                    yield event.plain_result(
+                        "当前未启用 URL 上传（默认关闭）。\n"
+                        "原因：开启后会让机器人主动下载外部链接，存在 SSRF/流量滥用风险。\n"
+                        "如确有需要，请在插件配置中手动开启。"
+                    )
+                    await self._audit_command_event(
+                        event,
+                        command="图床上传",
+                        result="rejected",
+                        reason="url_upload_disabled",
+                    )
+                    return
                 url = self._extract_first_url(event.message_str)
                 if not url:
                     yield event.plain_result(
                         "请发送：`/图床上传` 并附带一张图片，或在命令里提供图片 URL。"
+                    )
+                    await self._audit_command_event(
+                        event,
+                        command="图床上传",
+                        result="rejected",
+                        reason="missing_image_or_url",
                     )
                     return
                 result = await self._download_url_image(url)
@@ -508,9 +803,118 @@ class LocalImageBedPlugin(Star):
                 f"ID: {saved['id']}\n"
                 f"URL: {saved['url']}"
             )
+            await self._audit_command_event(
+                event,
+                command="图床上传",
+                result="ok",
+                image_id=str(saved["id"]),
+            )
         except Exception as exc:
             logger.exception("[ImageBed] command upload failed: %s", exc)
             yield event.plain_result(f"上传失败：{exc}")
+            await self._audit_command_event(
+                event,
+                command="图床上传",
+                result="error",
+                reason=str(exc),
+            )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("图床删除")
+    async def image_bed_delete(self, event: AstrMessageEvent, image_id: str = ""):
+        """管理员：按图片 ID 删除"""
+
+        image_id = (image_id or "").strip()
+        if not image_id:
+            yield event.plain_result("用法：/图床删除 <image_id>")
+            return
+
+        try:
+            result = await self.store.delete_image(image_id)
+            if not result.get("deleted"):
+                yield event.plain_result(f"未找到图片：{image_id}")
+                await self._audit_command_event(
+                    event,
+                    command="图床删除",
+                    result="not_found",
+                    image_id=image_id,
+                )
+                return
+            yield event.plain_result(
+                f"删除成功：{image_id}\n"
+                f"文件已删除：{'是' if result.get('file_removed') else '否（文件可能已不存在）'}"
+            )
+            await self._audit_command_event(
+                event,
+                command="图床删除",
+                result="ok",
+                image_id=image_id,
+            )
+        except Exception as exc:
+            logger.exception("[ImageBed] admin delete failed: %s", exc)
+            yield event.plain_result(f"删除失败：{exc}")
+            await self._audit_command_event(
+                event,
+                command="图床删除",
+                result="error",
+                image_id=image_id,
+                reason=str(exc),
+            )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("图床清理天数")
+    async def image_bed_cleanup_days(
+        self,
+        event: AstrMessageEvent,
+        days: str = "30",
+        limit: str = "1000",
+    ):
+        """管理员：清理早于指定天数的图片"""
+
+        try:
+            days_int = int(days)
+            limit_int = int(limit)
+        except Exception:
+            yield event.plain_result("参数错误。用法：/图床清理天数 <days> [limit]，例如 /图床清理天数 30 500")
+            return
+
+        if days_int < 1:
+            yield event.plain_result("days 必须 >= 1。")
+            return
+        if limit_int < 1:
+            yield event.plain_result("limit 必须 >= 1。")
+            return
+        if limit_int > 5000:
+            limit_int = 5000
+
+        try:
+            result = await self.store.cleanup_older_than(days=days_int, limit=limit_int)
+            yield event.plain_result(
+                "清理完成：\n"
+                f"阈值时间: {result['cutoff']}\n"
+                f"匹配记录: {result['matched']}\n"
+                f"删除记录: {result['deleted']}\n"
+                f"删除文件: {result['files_removed']}"
+            )
+            await self._audit_command_event(
+                event,
+                command="图床清理天数",
+                result="ok",
+                days=days_int,
+                limit=limit_int,
+                deleted=int(result.get("deleted") or 0),
+            )
+        except Exception as exc:
+            logger.exception("[ImageBed] admin cleanup failed: %s", exc)
+            yield event.plain_result(f"清理失败：{exc}")
+            await self._audit_command_event(
+                event,
+                command="图床清理天数",
+                result="error",
+                days=days_int,
+                limit=limit_int,
+                reason=str(exc),
+            )
 
     @filter.command("图床状态")
     async def image_bed_status(self, event: AstrMessageEvent):
@@ -519,11 +923,17 @@ class LocalImageBedPlugin(Star):
         host = self._cfg_str("listen_host", "127.0.0.1")
         port = self._cfg_int("listen_port", 18345)
         token_on = "是" if self._upload_token() else "否"
+        url_upload_on = "是" if self._enable_url_upload() else "否（默认关闭）"
+        rate_limit_count, rate_limit_window = self._rate_limit_config()
         lines = [
             "图床插件状态：",
             f"监听地址: {host}:{port}",
             f"公开地址: {self._public_base_url()}",
             f"上传 token: {token_on}",
+            "审计日志: 是（固定开启）",
+            f"审计文件: {self._audit_log_path()}",
+            f"URL 上传: {url_upload_on}",
+            f"速率限制: {rate_limit_count} 次 / {rate_limit_window} 秒（任一项为 0 表示关闭）",
             f"最大上传: {self._max_upload_bytes() // (1024 * 1024)} MB",
             f"存储目录: {self.store.images_dir}",
             f"上传接口: {self._public_base_url()}/upload",
@@ -537,11 +947,15 @@ class LocalImageBedPlugin(Star):
         lines = [
             "图床插件指令：",
             "1) /图床上传 + 图片：上传消息中的第一张图片",
-            "2) /图床上传 <URL>：下载 URL 图片后上传",
+            "2) /图床上传 <URL>：下载 URL 图片后上传（需先开启 URL 上传）",
             "3) /图床状态：查看监听地址与配置",
+            "4) /图床删除 <image_id>：管理员删除指定图片",
+            "5) /图床清理天数 <days> [limit]：管理员批量清理旧图",
             "HTTP 上传：POST /upload",
             "- multipart 字段: file 或 image",
             "- 或 JSON 字段: image_base64/base64",
             "- 如配置 upload_token，请带请求头 X-ImageBed-Token",
+            "- 不支持 query token（降低 token 泄露风险）",
+            "- 默认关闭 URL 上传（因存在 SSRF/流量滥用风险）",
         ]
         yield event.plain_result("\n".join(lines))

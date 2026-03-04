@@ -51,8 +51,10 @@
 | 指令 | 说明 |
 |------|------|
 | `/图床上传` + 一张图片 | 上传消息中的第一张图片，返回链接 |
-| `/图床上传 <图片URL>` | 下载该 URL 的图片后上传，返回链接 |
+| `/图床上传 <图片URL>` | 下载该 URL 的图片后上传，返回链接（默认关闭，需手动开启） |
 | `/图床状态` | 查看插件当前运行状态（监听地址、Token 等） |
+| `/图床删除 <image_id>` | 管理员删除指定图片 |
+| `/图床清理天数 <days> [limit]` | 管理员清理早于 N 天的旧图（可选每次最多清理条数） |
 | `/图床帮助` | 显示指令帮助 |
 
 ---
@@ -67,6 +69,9 @@
 | `listen_port` | 插件 HTTP 服务监听的端口 | `18345`（可自行更换未占用的端口） |
 | `public_base_url` | 最终返回给用户的链接前缀 | `https://你的域名/imgbed` |
 | `upload_token` | 上传接口的密码（Token） | 建议填一个随机字符串，如 `imgbed_abc123` |
+| `enable_url_upload` | 允许上传 URL 图片 | 默认 `false`（谨慎开启） |
+| `upload_rate_limit_count` | 单个来源 IP 在窗口期内可上传次数 | `30` |
+| `upload_rate_limit_window_sec` | 速率限制窗口（秒） | `60` |
 | `max_upload_mb` | 单张图片大小上限（MB） | `10`（可按需调整，范围 1-100） |
 | `enable_deduplicate` | 是否开启内容去重 | 开启 |
 
@@ -75,6 +80,9 @@
 - `listen_host` + `listen_port` → 决定"服务在服务器的哪个地址和端口上运行"
 - `public_base_url` → 决定"返回给用户的链接长什么样"
 - `upload_token` → 决定"是否需要密码才能上传"
+- 审计日志固定开启，文件固定为 `data/plugin_data/astrbot_plugin_local_image_bed/audit_upload.jsonl`
+- `enable_url_upload` → 是否允许机器人下载外部 URL（存在 SSRF/流量滥用风险）
+- `upload_rate_limit_*` → 控制单个来源的上传频率，降低接口被刷风险
 
 ---
 
@@ -110,6 +118,9 @@ docker compose up -d --force-recreate astrbot
 | `listen_port` | `18345` |
 | `public_base_url` | `https://你的域名/imgbed` |
 | `upload_token` | 自己定一个随机字符串 |
+| `enable_url_upload` | `false`（默认） |
+| `upload_rate_limit_count` | `30` |
+| `upload_rate_limit_window_sec` | `60` |
 | `max_upload_mb` | `10` |
 | `enable_deduplicate` | 开启 |
 
@@ -207,7 +218,8 @@ POST /upload
 如果配置了 `upload_token`，请求时需要带上 Token：
 
 - 方式一：请求头 `X-ImageBed-Token: 你的token`
-- 方式二：URL 参数 `?token=你的token`
+
+> 为降低 token 泄露风险，插件只支持 Header 方式，不支持 URL query 方式。
 
 **返回示例：**
 
@@ -272,6 +284,11 @@ curl -X POST "http://127.0.0.1:18345/upload" \
 **Q：上传时返回 401 错误？**
 
 说明你配置了 `upload_token`，但请求时没带 Token 或者 Token 填错了。检查请求头 `X-ImageBed-Token` 的值是否和配置一致。
+
+**Q：为什么 `/图床上传 <URL>` 不工作？**
+
+默认是关闭的。请在插件配置里把 `enable_url_upload` 打开后再试。  
+关闭是出于安全考虑：开启后机器人会主动下载外部 URL，存在 SSRF 和流量滥用风险。
 
 **Q：上传时提示"图片大小超出限制"？**
 

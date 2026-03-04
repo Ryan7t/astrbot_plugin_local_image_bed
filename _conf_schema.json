@@ -21,7 +21,25 @@
     "description": "上传接口 Token",
     "type": "string",
     "default": "",
-    "hint": "设置后，HTTP 上传必须携带 X-ImageBed-Token 或 token 查询参数"
+    "hint": "设置后，HTTP 上传必须携带请求头 X-ImageBed-Token（不支持 query token，避免泄露到 URL 日志）"
+  },
+  "enable_url_upload": {
+    "description": "允许 URL 上传",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。开启后机器人会主动下载外部 URL，存在 SSRF/流量滥用风险，请谨慎开启"
+  },
+  "upload_rate_limit_count": {
+    "description": "上传速率限制次数",
+    "type": "int",
+    "default": 30,
+    "hint": "单个来源 IP 在窗口期内允许的上传请求数，0 表示关闭速率限制"
+  },
+  "upload_rate_limit_window_sec": {
+    "description": "上传速率限制窗口(秒)",
+    "type": "int",
+    "default": 60,
+    "hint": "速率限制统计窗口，0 表示关闭速率限制"
   },
   "max_upload_mb": {
     "description": "单张图片大小上限(MB)",

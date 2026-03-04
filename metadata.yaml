@@ -1,6 +1,6 @@
 name: astrbot_plugin_local_image_bed
-display_name: Local Image Bed
-desc: 纯插件实现的本地持久化图床，支持上传图片并返回可访问链接
-version: v1.0.0
+display_name: 本地图床
+desc: 纯插件实现的本地持久化图床，支持上传图片并返回可访问链接，基于astrbot框架的插件
+version: v1.1.0
 author: Ethan
-repo: ""
+repo: "https://github.com/Ryan7t/astrbot_plugin_local_image_bed"
