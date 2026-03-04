@@ -1,0 +1,38 @@
+{
+  "listen_host": {
+    "description": "图床服务监听地址",
+    "type": "string",
+    "default": "127.0.0.1",
+    "hint": "默认仅本机访问；如需对外服务可改为 0.0.0.0"
+  },
+  "listen_port": {
+    "description": "图床服务监听端口",
+    "type": "int",
+    "default": 18345,
+    "hint": "插件内置 HTTP 服务端口"
+  },
+  "public_base_url": {
+    "description": "对外访问基地址",
+    "type": "string",
+    "default": "",
+    "hint": "返回给消息平台的图片链接前缀，例如 https://bot.example.com/imgbed；留空则使用 http://listen_host:listen_port"
+  },
+  "upload_token": {
+    "description": "上传接口 Token",
+    "type": "string",
+    "default": "",
+    "hint": "设置后，HTTP 上传必须携带 X-ImageBed-Token 或 token 查询参数"
+  },
+  "max_upload_mb": {
+    "description": "单张图片大小上限(MB)",
+    "type": "int",
+    "default": 10,
+    "hint": "允许范围 1-100 MB"
+  },
+  "enable_deduplicate": {
+    "description": "按图片内容去重",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，相同图片重复上传会复用同一个链接"
+  }
+}
